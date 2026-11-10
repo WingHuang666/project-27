@@ -1,0 +1,729 @@
+---
+title: "Indian Bail Judgments: Predictive Modeling and Case Typologies"
+subtitle: "Leakage-aware classification, interpretable features, and clustering"
+
+---
+
+## Section 0 — Install Required Packages
+
+
+```{python}
+
+import sys
+import subprocess
+import importlib.util
+
+required_packages = {
+    "numpy": "numpy",
+    "pandas": "pandas",
+    "matplotlib": "matplotlib",
+    "seaborn": "seaborn",
+    "scipy": "scipy",
+    "sklearn": "scikit-learn",
+    "joblib": "joblib",
+}
+
+missing_packages = [
+    package
+    for module, package in required_packages.items()
+    if importlib.util.find_spec(module) is None
+]
+
+if missing_packages:
+    print("Installing missing packages:", missing_packages)
+    subprocess.check_call([
+        sys.executable, "-m", "pip", "install", *missing_packages
+    ])
+    print("Installation completed. Restart the kernel if needed.")
+else:
+    print("All required packages are installed.")
+
+```
+
+
+
+
+## 1. Research design and reproducibility
+
+This project addresses five complementary questions. 
+
+RQ1 predicts bail outcomes from structured case descriptors; 
+
+RQ2 examines how outcome patterns vary across crime and bail types, with predictive comparison and descriptive subgroup rates; 
+
+RQ3 tests whether pre-decision factual and legal-issue narratives improve outcome prediction; 
+
+RQ4 models the use of a parity argument; and 
+
+RQ5 identifies case typologies using unsupervised learning. 
+
+All findings are **associations, not causal effects**. Model evaluation uses stratified holdout testing and stratified cross-validation on training data only. Post-decision judgment narratives are excluded from outcome prediction to prevent target leakage.
+
+Place `Indian-Bail-Judgments new.csv` beside this `.qmd` file. Run chunks in order. Dependencies: `pandas`, `numpy`, `scikit-learn`, `scipy`, `matplotlib`, `seaborn`, and `IPython`. For HTML rendering, use `quarto render Indian_Bail_Judgments_Analysis.qmd` in an environment with a Python Jupyter kernel.
+
+
+
+```{python}
+from pathlib import Path
+import re, warnings
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from IPython.display import display
+from scipy import sparse
+from sklearn.base import clone
+from sklearn.compose import ColumnTransformer
+from sklearn.decomposition import TruncatedSVD
+from sklearn.dummy import DummyClassifier
+from sklearn.ensemble import ExtraTreesClassifier, RandomForestClassifier
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.impute import SimpleImputer
+from sklearn.inspection import permutation_importance
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (average_precision_score, balanced_accuracy_score,
+    classification_report, confusion_matrix, f1_score, roc_auc_score,
+    precision_recall_curve, RocCurveDisplay, PrecisionRecallDisplay,
+    silhouette_score, adjusted_rand_score)
+from sklearn.model_selection import StratifiedKFold, train_test_split, cross_validate
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler, normalize
+from sklearn.cluster import MiniBatchKMeans
+
+RANDOM_STATE = 42
+rng = np.random.default_rng(RANDOM_STATE)
+sns.set_theme(style='whitegrid')
+pd.set_option('display.max_colwidth', 95)
+DATA_PATH = Path('Indian-Bail-Judgments new.csv')
+if not DATA_PATH.exists():
+    DATA_PATH = Path('/mnt/data/Indian-Bail-Judgments new.csv')
+if not DATA_PATH.exists():
+    raise FileNotFoundError('Put Indian-Bail-Judgments new.csv next to the QMD.')
+df = pd.read_csv(DATA_PATH)
+print('Shape:', df.shape)
+display(df.head(3))
+```
+
+## 2. Audit categorical and multi-value text
+
+Distinguish single-label categorical strings from free-text narratives. Commas, semicolons, conjunctions, and slashes may indicate multiple entities, but they can also be part of normal sentences or legal names. **Never split all text columns indiscriminately.** Preserve the original narrative for TF-IDF; extract optional multi-value tokens only when their meaning is clear. Do not label missing/unknown categories as negative.
+
+```{python}
+text_cols = df.select_dtypes(include=['object', 'string']).columns.tolist()
+audit = []
+for col in text_cols:
+    s = df[col].fillna('').astype(str)
+    audit.append({'column':col, 'unique':s.nunique(), 'mean_chars':round(s.str.len().mean(),1),
+        'max_chars':int(s.str.len().max()), 'pct_commas':round(s.str.contains(',', regex=False).mean()*100,1),
+        'pct_semicolons':round(s.str.contains(';', regex=False).mean()*100,1),
+        'pct_and':round(s.str.contains(r'\band\b',case=False,regex=True).mean()*100,1),
+        'examples': ' | '.join(s.head(2).str.slice(0,65))})
+audit_df = pd.DataFrame(audit).sort_values('mean_chars',ascending=False)
+display(audit_df)
+print('Missing by column:'); display(df.isna().sum().to_frame('missing'))
+print('Repeated case IDs:',df['case_id'].duplicated().sum())
+print('Exact duplicate rows:',df.duplicated().sum())
+```
+
+The dataset includes long-form `facts`, `legal_issues`, `judgment_reason`, `summary`, and `bail_outcome_label_detailed`. The latter three are potentially post-outcome descriptions and must not enter bail-outcome prediction. `judge` can contain multiple judge names, and `accused_name` can refer to multiple defendants; neither should be treated as a reliable single-person identifier. The original text is retained, while a cautiously derived judge-count indicator can be used for descriptive checks (not for outcome prediction).
+
+```{python}
+def clean_text(value):
+    if pd.isna(value):
+        return ''
+    return re.sub(r'\s+', ' ', str(value)).strip()
+
+def count_explicit_justices(value):
+    """Count explicit 'Justice' mentions; return NA if no explicit marker."""
+    matches = re.findall(r'\bJustice\b', clean_text(value), flags=re.I)
+    return len(matches) if matches else np.nan
+
+df['date_parsed'] = pd.to_datetime(df['date'], errors='coerce')
+df['year'] = df['date_parsed'].dt.year
+df['judge_mentions'] = df['judge'].map(count_explicit_justices)
+for c in ['facts','legal_issues','judgment_reason','summary','bail_outcome_label_detailed']:
+    df[c+'_clean'] = df[c].map(clean_text)
+    df[c+'_chars'] = df[c+'_clean'].str.len()
+print('Years:', df['year'].min(), 'to', df['year'].max())
+print('Judge-count missing (unknown, not zero):',df['judge_mentions'].isna().sum())
+display(df[['judge','judge_mentions','facts_chars','legal_issues_chars']].head())
+```
+
+## 3. Outcome and representation EDA
+
+Plots below answer concrete questions about outcome imbalance, category representation, and variation across observed subgroups. Rates are descriptive and are not evidence of discrimination or causal impact. Small groups are shown with their sample sizes.
+
+```{python}
+fig, axes = plt.subplots(1,2,figsize=(13,4))
+sns.countplot(data=df,x='bail_outcome',ax=axes[0],order=['Granted','Rejected'],color='steelblue')
+axes[0].set_title('Observed bail outcomes')
+crime_counts = df['crime_type'].value_counts()
+sns.barplot(x=crime_counts.values,y=crime_counts.index,ax=axes[1],color='steelblue')
+axes[1].set_title('Cases by crime type'); axes[1].set_xlabel('Cases')
+plt.tight_layout(); plt.show()
+
+rates = (df.assign(granted=df['bail_outcome'].eq('Granted').astype(int))
+    .groupby(['crime_type','bail_type'],observed=True)['granted']
+    .agg(['mean','size']).reset_index())
+rates = rates[rates['size']>=10]
+if len(rates):
+    pivot = rates.pivot(index='crime_type',columns='bail_type',values='mean')
+    plt.figure(figsize=(10,6)); sns.heatmap(pivot,annot=True,fmt='.2f',cmap='Blues',vmin=0,vmax=1)
+    plt.title('Observed grant rate by crime and bail type (cells n >= 10)')
+    plt.tight_layout(); plt.show()
+display(df.groupby('accused_gender')['bail_outcome'].agg(n='size',grant_rate=lambda x:x.eq('Granted').mean()))
+```
+
+
+## Exploratory Data Analysis
+
+The dataset covers Indian bail judgments from 1975 to 2025, comprising 1,200 cases. Approximately 61.5% of bail applications were granted, while 38.5% were rejected, indicating moderate class imbalance. Macro-F1 is therefore selected as the primary classification metric.
+
+Case frequencies vary across crime categories, with narcotics, theft or robbery, dowry harassment, fraud or cheating, and sexual offenses among the most frequently represented categories.
+
+Observed bail grant rates differ across crime types and bail procedures. For example, regular bail applications in cybercrime cases show a 93% grant rate, compared with 77% for anticipatory bail. In theft or robbery cases, the corresponding rates are 53% and 30%. These descriptive differences do not establish causal relationships.
+
+Female defendants have an observed grant rate of 69.9%, compared with 60.3% for male defendants. However, differences in case characteristics and sample composition may contribute to this gap. The Multiple and Unknown gender categories contain only three cases each, limiting reliable interpretation.
+
+The dataset also includes multi-judge records and substantial narrative text. These fields require careful preprocessing to preserve information and prevent data leakage.
+
+Overall, the EDA supports further investigation using classification models, controlled association analysis, text-based modeling, and clustering. Findings should be interpreted as associations within the observed dataset rather than causal or population-wide conclusions.
+
+
+
+
+
+
+
+## 4. Shared modeling functions and fair evaluation
+
+Candidate models: a majority-class Dummy baseline, regularized Logistic Regression, Random Forest, and Extra Trees. The Dummy is used for context but **never selected for feature-importance or model plots**. The primary selection metric is **balanced accuracy** for bail outcomes (it gives both outcome classes equal weight) and **average precision** for parity-argument prediction (to focus on identifying positive cases). ROC-AUC and F1 are secondary checks. Cross-validation selects the model on training data only; the test set is held out until final evaluation. Text vectorization is fit inside each fold, preventing vocabulary leakage.
+
+```{python}
+CV = StratifiedKFold(n_splits=4,shuffle=True,random_state=RANDOM_STATE)
+SCORING = {'balanced_accuracy':'balanced_accuracy','f1':'f1',
+           'roc_auc':'roc_auc','average_precision':'average_precision'}
+
+def models():
+    return {
+        'Dummy (baseline)':DummyClassifier(strategy='prior'),
+        'Logistic Regression':LogisticRegression(max_iter=1600,class_weight='balanced',solver='liblinear',random_state=RANDOM_STATE),
+        'Random Forest':RandomForestClassifier(n_estimators=150,min_samples_leaf=3,
+                                               class_weight='balanced_subsample',n_jobs=-1,random_state=RANDOM_STATE),
+        'Extra Trees':ExtraTreesClassifier(n_estimators=150,min_samples_leaf=3,
+                                          class_weight='balanced',n_jobs=-1,random_state=RANDOM_STATE)}
+
+def structured_preprocessor(columns):
+    numeric = [c for c in columns if pd.api.types.is_numeric_dtype(df[c])]
+    categorical = [c for c in columns if c not in numeric]
+    transformers=[]
+    if numeric:
+        transformers.append(('num',Pipeline([('impute',SimpleImputer(strategy='median')),
+                                            ('scale',StandardScaler())]),numeric))
+    if categorical:
+        transformers.append(('cat',Pipeline([('impute',SimpleImputer(strategy='most_frequent')),
+                                            ('onehot',OneHotEncoder(handle_unknown='ignore'))]),categorical))
+    return ColumnTransformer(transformers,sparse_threshold=0.3)
+
+def evaluate_candidates(X,y,preprocessor,metric='balanced_accuracy',prefix='RQ'):
+    if y.nunique()!=2 or y.value_counts().min()<8:
+        print(f'{prefix}: insufficient class support for reliable classification.')
+        return None
+    train_idx,test_idx=train_test_split(np.arange(len(y)),test_size=.2,
+        stratify=y,random_state=RANDOM_STATE)
+    Xtr,Xte=X.iloc[train_idx],X.iloc[test_idx]
+    ytr,yte=y.iloc[train_idx],y.iloc[test_idx]
+    rows=[]; fitted={}
+    for name,model in models().items():
+        pipe=Pipeline([('prep',clone(preprocessor)),('model',clone(model))])
+        scores=cross_validate(pipe,Xtr,ytr,cv=CV,scoring=SCORING,n_jobs=1,error_score='raise')
+        rows.append({'model':name,**{m:np.mean(scores['test_'+m]) for m in SCORING},
+                     'cv_std':np.std(scores['test_'+metric])})
+    results=pd.DataFrame(rows).sort_values(metric,ascending=False).reset_index(drop=True)
+    display(results.round(3))
+    eligible=results[results['model']!='Dummy (baseline)']
+    # If the baseline wins, explicitly report that no learned model beats it.
+    best_name=eligible.iloc[0]['model']
+    if results.iloc[0]['model']=='Dummy (baseline)':
+        print('WARNING: Dummy ranks first; no learned model demonstrably outperforms baseline.')
+    best=Pipeline([('prep',clone(preprocessor)),('model',clone(models()[best_name]))])
+    best.fit(Xtr,ytr)
+    pred=best.predict(Xte)
+    prob=best.predict_proba(Xte)[:,1]
+    print(f'{prefix} selected non-Dummy model:',best_name)
+    print('Held-out balanced accuracy:',round(balanced_accuracy_score(yte,pred),3),
+          '| ROC-AUC:',round(roc_auc_score(yte,prob),3),
+          '| AP:',round(average_precision_score(yte,prob),3))
+    print(classification_report(yte,pred,zero_division=0))
+    fig,ax=plt.subplots(1,2,figsize=(11,4))
+    sns.heatmap(confusion_matrix(yte,pred),annot=True,fmt='d',cmap='Blues',ax=ax[0])
+    ax[0].set(title=f'{prefix}: {best_name} confusion matrix',xlabel='Predicted',ylabel='Actual')
+    PrecisionRecallDisplay.from_predictions(yte,prob,ax=ax[1],name=best_name)
+    ax[1].set_title(f'{prefix}: precision–recall curve')
+    plt.tight_layout();plt.show()
+    return {'best_name':best_name,'best':best,'results':results,
+            'X_train':Xtr,'X_test':Xte,'y_train':ytr,'y_test':yte,'prob':prob}
+
+def show_permutation(result,metric='balanced_accuracy',top=15):
+    if result is None:return
+    # Original-column importance, including whole text fields; on held-out data.
+    perm=permutation_importance(result['best'],result['X_test'],result['y_test'],
+        scoring=metric,n_repeats=5,random_state=RANDOM_STATE,n_jobs=1)
+    imp=pd.Series(perm.importances_mean,index=result['X_test'].columns).sort_values(ascending=False)
+    print('Permutation importance (drop in held-out metric; negatives may reflect noise):')
+    display(imp.to_frame('mean_metric_drop').head(top).round(4))
+    imp.head(top).sort_values().plot.barh(figsize=(9,max(3,top*.3)),title='Held-out permutation importance')
+    plt.xlabel('Decrease in evaluation score when shuffled');plt.tight_layout();plt.show()
+```
+
+## 5. RQ1 — Can structured pre-decision features predict bail outcomes?
+
+Use only potentially pre-decision descriptors: court, region, crime type, bail type, accused gender, prior cases, and year. Court and region are associations and may proxy case mix; they should not be interpreted causally. `bail_cancellation_case` may reflect the case type and is analyzed descriptively but omitted from the conservative prediction feature set. `landmark_case`, `bias_flag`, and `parity_argument_used` may be retrospectively coded, so are excluded from RQ1.
+
+```{python}
+TARGET = 'bail_outcome'
+y_bail=df[TARGET].eq('Granted').astype(int)
+base_cols=['court','region','crime_type','bail_type','accused_gender','prior_cases','year']
+X1=df[base_cols].copy()
+rq1=evaluate_candidates(X1,y_bail,structured_preprocessor(base_cols),
+                        metric='balanced_accuracy',prefix='RQ1')
+show_permutation(rq1,'balanced_accuracy',top=12)
+```
+
+
+## RQ1: Predicting Bail Outcomes Using Structured Case Characteristics
+
+### Research Objective
+
+This analysis evaluates whether structured case characteristics can predict bail outcomes and identifies the variables contributing most to predictive performance.
+
+### Model Comparison and Selection
+
+Random Forest achieved the highest cross-validation balanced accuracy (0.664), outperforming Logistic Regression (0.651) and Extra Trees (0.646). Although the Dummy baseline achieved a higher F1 score, its balanced accuracy of 0.500 and ROC-AUC of 0.500 indicated limited discriminatory ability.
+
+Random Forest was therefore selected based on balanced accuracy, which accounts for performance across both outcome classes.
+
+### Predictive Performance
+
+On the held-out test set of 240 cases, Random Forest achieved:
+
+- Balanced Accuracy: 0.663
+- ROC-AUC: 0.728
+- Average Precision: 0.821
+- Overall Accuracy: 0.679
+
+The confusion matrix showed 163 correct predictions and 77 incorrect predictions. Recall was higher for granted cases (73.5%) than for rejected cases (59.1%), indicating that the model was less effective at identifying rejected applications.
+
+The precision–recall curve demonstrated useful discrimination of granted cases, although precision declined as recall increased.
+
+### Feature Importance
+
+Permutation importance identified crime type (0.0824) as the most influential predictor, followed by prior cases (0.0368), year (0.0292), and court (0.0287).
+
+Region contributed moderately, while accused gender and bail type showed relatively small additional predictive contributions.
+
+These importance values measure model reliance rather than causal effects and do not indicate the direction of each variable's association with bail outcomes.
+
+### Conclusion
+
+Random Forest provided the strongest performance among the evaluated non-baseline models, demonstrating that structured case characteristics contain meaningful predictive information.
+
+However, its moderate balanced accuracy and weaker recall for rejected applications indicate substantial limitations. The results should be interpreted as retrospective predictive associations rather than reliable forecasts of individual judicial decisions.
+
+Future analysis could evaluate temporal generalization and assess whether narrative case information improves predictive performance beyond structured variables.
+
+
+
+
+
+## 6. RQ2 — Do crime and bail categories show different outcome patterns?
+
+This question deliberately contrasts simple category-level modeling with the richer structured model from RQ1. The primary objective is to test how much predictive information crime and bail type contain **on their own**. It does not identify causal effects of charge type or procedural category.
+
+```{python}
+rq2_cols=['crime_type','bail_type']
+X2=df[rq2_cols].copy()
+rq2=evaluate_candidates(X2,y_bail,structured_preprocessor(rq2_cols),
+                        metric='balanced_accuracy',prefix='RQ2')
+show_permutation(rq2,'balanced_accuracy',top=2)
+if rq1 and rq2:
+    print('RQ1 vs RQ2 best training-CV balanced accuracy:',
+          round(rq1['results'].set_index('model').loc[rq1['best_name'],'balanced_accuracy'],3),
+          round(rq2['results'].set_index('model').loc[rq2['best_name'],'balanced_accuracy'],3))
+```
+
+
+## RQ2: Predicting Bail Outcomes Using Crime Type and Bail Type
+
+### Research Objective
+
+This analysis examines whether crime type and bail type alone can predict bail outcomes and evaluates how this simplified feature set compares with the broader structured model developed in RQ1.
+
+### Model Comparison and Selection
+
+Logistic Regression achieved the highest cross-validation balanced accuracy (0.635), outperforming Extra Trees (0.610) and Random Forest (0.600). It also achieved the highest ROC-AUC (0.653) and Average Precision (0.749) among the evaluated models.
+
+Although the Dummy baseline obtained a higher positive-class F1 score, its balanced accuracy of 0.500 indicated an inability to discriminate effectively between granted and rejected applications.
+
+Logistic Regression was therefore selected as the best-performing non-baseline model.
+
+### Predictive Performance
+
+On the held-out test set of 240 cases, Logistic Regression achieved:
+
+- Balanced Accuracy: 0.575
+- ROC-AUC: 0.620
+- Average Precision: 0.711
+- Overall Accuracy: 0.571
+
+The confusion matrix showed 137 correct predictions and 103 incorrect predictions. Recall was 55.8% for granted cases and 59.1% for rejected cases, indicating limited predictive performance across both classes.
+
+### Feature Importance
+
+Permutation importance identified crime type (0.1029) as the primary predictor. Bail type showed a slightly negative importance value (-0.0075), suggesting limited additional predictive contribution under the current model and evaluation setup.
+
+These results indicate model reliance rather than causal relationships or the legal significance of individual variables.
+
+### Comparison with RQ1
+
+The broader RQ1 model outperformed RQ2 across all reported held-out metrics. Balanced accuracy increased from 0.575 to 0.663, while ROC-AUC increased from 0.620 to 0.728.
+
+This suggests that additional case characteristics provide useful predictive information beyond crime type and bail type. However, because the models also differ in algorithm, the performance gap cannot be attributed exclusively to feature inclusion.
+
+### Conclusion
+
+Crime type provides meaningful predictive information, but crime type and bail type alone are insufficient for accurate bail outcome prediction.
+
+The simplified model demonstrates moderate-to-weak discriminatory ability, highlighting the importance of incorporating additional case characteristics and evaluating their incremental predictive contributions through controlled model comparisons.
+
+
+
+
+## 7. RQ3 — Do case facts and legal questions add predictive value?
+
+The text-based pipeline uses TF-IDF word unigrams and bigrams, preserves the content of long narrative cells, and caps vocabulary to control complexity. `facts` and `legal_issues` may still contain retrospectively edited details in this curated dataset: interpret the result as **retrospective association**, not deployable real-time prediction. Never use `judgment_reason`, `summary`, or detailed outcome labels here. The structured-only RQ1 is the comparison baseline; identical holdout splits are used.
+
+```{python}
+X3=df[base_cols+['facts_clean','legal_issues_clean']].copy()
+text_prep=ColumnTransformer([
+    ('structured',structured_preprocessor(base_cols),base_cols),
+    ('facts',TfidfVectorizer(ngram_range=(1,2),min_df=3,max_df=.95,
+                             max_features=2500,sublinear_tf=True,stop_words='english'),'facts_clean'),
+    ('legal',TfidfVectorizer(ngram_range=(1,2),min_df=3,max_df=.95,
+                             max_features=1800,sublinear_tf=True,stop_words='english'),'legal_issues_clean')
+],sparse_threshold=1.0)
+rq3=evaluate_candidates(X3,y_bail,text_prep,metric='balanced_accuracy',prefix='RQ3')
+show_permutation(rq3,'balanced_accuracy',top=12)
+if rq1 and rq3:
+    print('Compare held-out performance on the same split, but avoid selecting a model based on the test set.')
+```
+
+
+## RQ3: Does Legal Narrative Text Improve Bail Outcome Prediction?
+
+### Research Objective
+
+This analysis investigates whether incorporating legal narratives, including case facts and legal issues, improves bail outcome prediction beyond structured case characteristics.
+
+### Model Comparison and Selection
+
+Logistic Regression achieved the highest cross-validation balanced accuracy (0.743), slightly outperforming Extra Trees (0.735) and Random Forest (0.698).
+
+Although the alternative models achieved marginally higher scores on certain secondary metrics, Logistic Regression was selected based on balanced accuracy, the primary evaluation criterion.
+
+### Predictive Performance
+
+On the held-out test set of 240 cases, Logistic Regression achieved:
+
+- Balanced Accuracy: 0.779
+- ROC-AUC: 0.859
+- Average Precision: 0.906
+- Overall Accuracy: 0.788
+
+The confusion matrix showed 189 correct predictions and 51 incorrect predictions. Recall reached 81.6% for granted cases and 74.2% for rejected cases.
+
+The precision–recall curve demonstrated strong ranking performance for granted applications relative to the positive-class prevalence.
+
+### Feature Importance
+
+Permutation importance identified legal issues (0.0948) and case facts (0.0652) as the two most influential predictors, followed by crime type (0.0548), court (0.0382), prior cases (0.0298), and region (0.0294).
+
+These findings suggest that narrative information captures predictive patterns beyond broad structured categories. However, feature importance reflects model reliance rather than causal influence or legal significance.
+
+### Comparison with RQ1 and RQ2
+
+RQ3 achieved the strongest held-out performance among the three approaches. Compared with RQ1, balanced accuracy increased from 0.663 to 0.779, while ROC-AUC increased from 0.728 to 0.859.
+
+The results support the predictive value of incorporating legal narratives. However, because the selected algorithms differ between RQ1 and RQ3, a controlled comparison using identical algorithms would provide stronger evidence of the incremental contribution of text.
+
+### Limitations and Conclusion
+
+Legal narratives may contain information recorded or summarized after judicial decisions. Consequently, potential data leakage must be considered before interpreting the results as prospective predictions.
+
+Overall, RQ3 demonstrates that combining structured case characteristics with legal narrative features improves retrospective classification performance. Nevertheless, the findings do not establish causal relationships or demonstrate reliable pre-decision forecasting ability.
+
+
+
+
+
+## 8. RQ4 — Which recorded features predict parity-argument use?
+
+The target is `parity_argument_used`. This is a documented argument in the judgment record, so the analysis is explanatory/retrospective rather than a prospective prediction of judicial reasoning. Exclude `judgment_reason`, `summary`, and detailed outcome descriptions because they may explicitly mention the parity argument. The primary selection metric is average precision, useful when the positive class is less frequent. Group-level rates are also shown.
+
+```{python}
+y_parity=df['parity_argument_used'].astype(int)
+rq4_cols=['court','region','crime_type','bail_type','accused_gender','prior_cases','year']
+X4=df[rq4_cols].copy()
+rq4=evaluate_candidates(X4,y_parity,structured_preprocessor(rq4_cols),
+                        metric='average_precision',prefix='RQ4')
+show_permutation(rq4,'average_precision',top=12)
+parity_by_type=(df.groupby('bail_type')['parity_argument_used']
+                .agg(['mean','size']).sort_values('size',ascending=False))
+display(parity_by_type)
+```
+
+
+## RQ4: Identifying Bail Cancellation-Related Cases
+
+### Research Objective
+
+This analysis evaluates whether structured case characteristics can identify bail cancellation-related cases and examines which features contribute most to classification performance.
+
+### Model Comparison and Selection
+
+Random Forest achieved the highest cross-validation Average Precision (0.606), outperforming Extra Trees (0.589) and Logistic Regression (0.578).
+
+Although Logistic Regression achieved slightly higher balanced accuracy (0.691) and F1 (0.560), Random Forest was selected based on Average Precision, which was prioritized because cancellation-related cases represented approximately 28.4% of the dataset.
+
+### Predictive Performance
+
+On the held-out test set of 240 cases, Random Forest achieved:
+
+- Balanced Accuracy: 0.623
+- ROC-AUC: 0.693
+- Average Precision: 0.512
+- Overall Accuracy: 0.683
+
+The confusion matrix showed 164 correct predictions and 76 incorrect predictions.
+
+For cancellation-related cases, precision was 44.6% and recall was 48.5%, indicating that the model failed to identify more than half of the positive cases.
+
+Although Average Precision exceeded the positive-class prevalence of approximately 28.3%, the model's ability to identify cancellation-related cases remained limited.
+
+### Feature Importance
+
+Permutation importance identified crime type (0.0626) and bail type (0.0558) as the most influential predictors, followed by year (0.0401) and court (0.0329).
+
+Region, prior cases, and accused gender contributed relatively little additional predictive information.
+
+These importance scores measure model reliance and do not establish causal relationships.
+
+### Cancellation-Related Cases by Bail Type
+
+Regular bail cases showed the highest observed cancellation-related proportion (33.0%), followed by anticipatory bail (15.3%) and interim bail (5.3%).
+
+However, these differences may reflect variations in case composition, procedural context, or labeling practices rather than actual cancellation risks.
+
+The smaller bail categories contained very few observations, limiting meaningful comparisons.
+
+### Limitations and Conclusion
+
+Random Forest demonstrated moderate-to-weak classification performance, particularly for cancellation-related cases.
+
+An important limitation concerns the interpretation of the target variable. If the cancellation indicator represents case classification rather than an observed judicial decision, the model cannot be interpreted as predicting whether bail will ultimately be cancelled.
+
+Overall, the results suggest that structured case characteristics contain some information relevant to identifying cancellation-related cases, but predictive performance remains insufficient for reliable individual-case assessment.
+
+
+
+
+
+## 9. RQ5 — Can unsupervised learning identify meaningful case types?
+
+Clustering uses crime/bail type, prior cases, court/region, and TF-IDF from case facts and legal questions. It **excludes outcomes and all post-judgment narratives**, preventing clusters from being defined by the answer. Sparse features are compressed with SVD, standardized by row normalization, then clustered with MiniBatch K-Means. Both inertia (Elbow) and silhouette are plotted. Silhouette is evaluated on a fixed random sample; it is not the sole selection criterion. The chosen k is a transparent heuristic combining elbow curvature, silhouette, and interpretability; low silhouette indicates weak separation.
+
+```{python}
+cluster_cols=['crime_type','bail_type','prior_cases','region']
+cluster_prep=ColumnTransformer([
+    ('categorical',OneHotEncoder(handle_unknown='ignore'),cluster_cols),
+    ('facts',TfidfVectorizer(max_features=1800,min_df=3,ngram_range=(1,2),stop_words='english'),'facts_clean'),
+    ('legal',TfidfVectorizer(max_features=1200,min_df=3,ngram_range=(1,2),stop_words='english'),'legal_issues_clean')
+],sparse_threshold=1.0)
+cluster_input=df[cluster_cols+['facts_clean','legal_issues_clean']].copy()
+Z_sparse=cluster_prep.fit_transform(cluster_input)
+svd=TruncatedSVD(n_components=min(50,Z_sparse.shape[1]-1,Z_sparse.shape[0]-1),random_state=RANDOM_STATE)
+Z=normalize(svd.fit_transform(Z_sparse))
+print('SVD explained variance ratio:',round(svd.explained_variance_ratio_.sum(),3))
+ks=list(range(2,min(10,len(df)-1)+1))
+sample_idx=np.random.default_rng(RANDOM_STATE).choice(len(Z),size=min(1000,len(Z)),replace=False)
+records=[];cluster_labels={}
+for k in ks:
+    km=MiniBatchKMeans(n_clusters=k,random_state=RANDOM_STATE,n_init=10,batch_size=256,max_iter=200)
+    labels=km.fit_predict(Z)
+    cluster_labels[k]=labels
+    sil=silhouette_score(Z[sample_idx],labels[sample_idx]) if len(set(labels[sample_idx]))>1 else np.nan
+    records.append({'k':k,'inertia':km.inertia_,'silhouette':sil,
+                    'smallest_cluster':np.bincount(labels,minlength=k).min()})
+cluster_scores=pd.DataFrame(records)
+display(cluster_scores.round(4))
+fig,axes=plt.subplots(1,2,figsize=(12,4))
+axes[0].plot(cluster_scores['k'],cluster_scores['inertia'],'o-')
+axes[0].set(xlabel='k',ylabel='Inertia',title='Elbow: within-cluster inertia')
+axes[1].plot(cluster_scores['k'],cluster_scores['silhouette'],'o-')
+axes[1].set(xlabel='k',ylabel='Sample silhouette',title='Separation: silhouette')
+plt.tight_layout();plt.show()
+
+# Elbow heuristic: maximum perpendicular distance from the straight line
+# connecting the first and last inertia points, after normalizing axes.
+x=(cluster_scores['k'].to_numpy()-min(ks))/(max(ks)-min(ks))
+y=cluster_scores['inertia'].to_numpy()
+y=(y-y.min())/(y.max()-y.min()+1e-12)
+dist=np.abs((y[-1]-y[0])*x-(x[-1]-x[0])*y+x[-1]*y[0]-y[-1]*x[0]) / (np.hypot(y[-1]-y[0],x[-1]-x[0])+1e-12)
+elbow_k=int(cluster_scores.iloc[np.argmax(dist)]['k'])
+sil_k=int(cluster_scores.loc[cluster_scores['silhouette'].idxmax(),'k'])
+# Favor k near elbow if its silhouette is within 0.03 of the maximum.
+max_sil=cluster_scores['silhouette'].max()
+chosen_k=elbow_k if cluster_scores.set_index('k').loc[elbow_k,'silhouette']>=max_sil-.03 else sil_k
+print('Elbow heuristic k:',elbow_k,'| highest silhouette k:',sil_k,'| chosen k:',chosen_k)
+print('Inspect both charts and cluster sizes; override chosen_k explicitly if a more defensible k emerges.')
+df['cluster']=cluster_labels[chosen_k]
+```
+
+
+## RQ5: Clustering Indian Bail Judgment Cases
+
+### Research Objective
+
+This analysis investigates whether Indian bail judgment cases can be grouped into meaningful clusters based on their characteristics and legal narrative information.
+
+### Dimensionality Reduction
+
+Truncated Singular Value Decomposition (SVD) was used to reduce the dimensionality of the feature space. The retained components explained approximately 66.1% of the original feature variance.
+
+Although dimensionality reduction facilitates clustering, some information may be lost during the transformation.
+
+### Selection of the Number of Clusters
+
+Both the Elbow Method and Silhouette Score were evaluated for K values ranging from 2 to 10.
+
+The Elbow Method indicated a noticeable reduction in the improvement of within-cluster inertia after K = 4. Inertia decreased from 681.49 at K = 3 to 615.82 at K = 4, followed by a smaller reduction to 600.43 at K = 5.
+
+The highest Silhouette Score was observed at K = 4 (0.1608), marginally exceeding K = 3 (0.1597).
+
+Additionally, the smallest cluster at K = 4 contained 175 observations, suggesting that the selected solution did not produce extremely small groups.
+
+Based on these considerations, **K = 4 was selected** as a reasonable balance between compactness, separation, and cluster size.
+
+### Clustering Quality
+
+Despite being the preferred solution, the Silhouette Score of 0.1608 indicates relatively weak separation between clusters.
+
+This suggests that cases may share overlapping characteristics rather than forming clearly distinct groups.
+
+Furthermore, the small difference between the Silhouette Scores for K = 3 and K = 4 indicates that the selected number of clusters should not be considered definitive.
+
+### Conclusion
+
+The combined Elbow and Silhouette analyses support a four-cluster solution for exploratory segmentation.
+
+However, the relatively low Silhouette Score indicates limited cluster separation. Additional analysis of cluster profiles, legal terminology, crime-type distributions, and bail outcomes is necessary to determine whether the clusters represent meaningful and interpretable case categories.
+
+The findings should therefore be treated as exploratory rather than evidence of four naturally distinct groups of Indian bail judgments.
+
+
+
+
+
+```{python}
+profile=(df.assign(granted=df['bail_outcome'].eq('Granted').astype(int))
+    .groupby('cluster').agg(n=('case_id','size'),grant_rate=('granted','mean'),
+                            parity_rate=('parity_argument_used','mean'),
+                            bias_flag_rate=('bias_flag','mean'),
+                            median_year=('year','median')))
+display(profile.round(3))
+for col in ['crime_type','bail_type','prior_cases']:
+    print('\nCluster distribution:',col)
+    display(pd.crosstab(df['cluster'],df[col],normalize='index').round(3))
+# 2D projection is illustrative only; not a proof of true separation.
+coords=TruncatedSVD(n_components=2,random_state=RANDOM_STATE).fit_transform(Z)
+plot_idx=np.random.default_rng(RANDOM_STATE).choice(len(Z),size=min(1200,len(Z)),replace=False)
+plt.figure(figsize=(9,5))
+sns.scatterplot(x=coords[plot_idx,0],y=coords[plot_idx,1],
+                hue=df['cluster'].iloc[plot_idx].astype(str),s=23,alpha=.65)
+plt.title('Fixed-sample 2D projection of clusters (descriptive only)')
+plt.xlabel('SVD component 1');plt.ylabel('SVD component 2')
+plt.tight_layout();plt.show()
+```
+
+
+
+## RQ5: Cluster Profiles and Interpretation
+
+### Cluster Overview
+
+The four-cluster solution identified distinct case profiles with different bail outcomes, procedural characteristics, and prior case histories.
+
+Cluster sizes ranged from 175 to 432 cases, with observed bail grant rates varying from 48.3% to 80.6%.
+
+### Cluster Characteristics
+
+**Cluster 0 — Regular Bail with Unknown Prior History (n = 432)**
+
+This cluster consisted predominantly of regular bail cases (97.7%), with all observations having unknown prior case history. Cybercrime and narcotics were among the most frequently represented crime categories. The observed bail grant rate was 61.1%.
+
+**Cluster 1 — Regular Bail with Prior Cases (n = 325)**
+
+This cluster primarily contained regular bail applications (96.0%), with all defendants recorded as having prior cases. Extortion, theft or robbery, and fraud or cheating were prominent crime categories. The cluster had the lowest observed grant rate (48.3%).
+
+**Cluster 2 — Anticipatory Bail Cases (n = 268)**
+
+All observations in this cluster were anticipatory bail cases. Domestic violence and dowry harassment were the most frequently represented crime categories. The observed grant rate was 64.9%.
+
+**Cluster 3 — Regular Bail without Prior Cases (n = 175)**
+
+This cluster consisted predominantly of regular bail cases (98.3%), with all observations recorded as having no prior cases. Narcotics and kidnapping were prominent crime categories. It had the highest observed grant rate (80.6%).
+
+### Cluster Separation and Interpretation
+
+The two-dimensional SVD visualization displayed visually distinct groups. However, the relatively low Silhouette Score (0.1608) indicates limited separation in the clustering feature space.
+
+Cluster membership was strongly associated with two existing categorical variables: bail type and prior case history. Therefore, the clusters primarily represent combinations of known procedural and case-history characteristics rather than entirely new latent legal categories.
+
+### Additional Indicators
+
+Recorded parity rates ranged from 15.3% to 40.0%, while bias flag rates remained below 2% across all clusters.
+
+These indicators should not be interpreted as direct measures of judicial fairness or discrimination without confirming their operational definitions and labeling procedures.
+
+### Conclusion
+
+The four-cluster solution provides interpretable case segmentation and reveals substantial differences in observed bail grant rates.
+
+However, the clustering structure is largely driven by bail type and prior case history, while overall separation remains relatively weak.
+
+The findings are therefore best understood as exploratory case profiles rather than evidence of four naturally distinct legal case categories or causal relationships between cluster membership and judicial outcomes.
+
+
+
+
+
+
+## 10. Interpretation, limitations, and conclusions
+
+- **Model choice:** Select based on training-only cross-validation, prioritizing balanced accuracy for RQ1–RQ3 and average precision for RQ4. Compare with the Dummy baseline; if it wins, state that predictive value is not demonstrated. A second-place learned model may be inspected for feature importance, but it must not be presented as outperforming the baseline.
+- **Feature importance:** Permutation importance measures predictive dependence on a variable, not a causal effect. Correlated features can share or mask importance. Negative importance is sampling noise or a warning of unstable generalization.
+- **Text handling:** TF-IDF preserves the words and phrases in each narrative cell without arbitrarily splitting or discarding multiple ideas. The model does not fully capture legal semantics, negation, or chronology; inspect the source texts for substantive interpretation.
+- **Leakage:** Bail outcome details, judicial reasoning, and judgment summaries are not valid inputs for predicting bail outcomes. Factual and legal-issue narratives may still have been written after decisions; therefore this is a retrospective proof of concept.
+- **Bias:** `bias_flag` has too few positive cases to support a reliable predictive model. Differences by gender, court, or region do not establish judicial bias without confounder adjustment, adequate representation, and external validation.
+- **Clustering:** Compare elbow, silhouette, size balance, and meaningful cluster profiles. Cluster outcome rates are **post-hoc descriptions** only; they do not enter clustering.
+- **Scope:** This is an observational collection of 1,200 recorded cases, not necessarily a representative sample of all Indian bail decisions. Avoid national-level claims or individual legal recommendations.
+
+```{python}
+print('Research summary')
+for label,result in [('RQ1',rq1),('RQ2',rq2),('RQ3',rq3),('RQ4',rq4)]:
+    if result:
+        top=result['results'].iloc[0]
+        print(f"{label}: selected learned model = {result['best_name']}; top CV model = {top['model']}; "
+              f"top CV balanced accuracy = {top['balanced_accuracy']:.3f}; top CV AP = {top['average_precision']:.3f}")
+print(f'RQ5: elbow={elbow_k}, silhouette={sil_k}, chosen={chosen_k}')
+```
